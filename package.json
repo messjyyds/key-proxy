@@ -1,0 +1,11 @@
+﻿{
+    "main":  "server.js",
+    "engines":  {
+                    "node":  "\u003e=18"
+                },
+    "name":  "key-proxy",
+    "version":  "1.0.0",
+    "scripts":  {
+                    "start":  "node server.js"
+                }
+}
