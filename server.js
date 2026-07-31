@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const PORT = 3456;
+const PORT = process.env.PORT || 3456;
 const ADMIN_PASSWORD = 'django2026';
 const DEEPSEEK_API = 'api.deepseek.com';
 const DATA_FILE = path.join(__dirname, 'keys.json');
@@ -100,6 +100,16 @@ function handleProxy(req, res) {
     return;
   }
 
+  // 检查到期
+  if (keyData.expiresAt) {
+    const now = new Date().toISOString();
+    if (now > keyData.expiresAt) {
+      res.writeHead(403);
+      res.end(JSON.stringify({ error: 'Key 已过期，联系卖家续费', expiresAt: keyData.expiresAt }));
+      return;
+    }
+  }
+
   if (keyData.used >= keyData.budget) {
     res.writeHead(429);
     res.end(JSON.stringify({ error: '额度已用完，联系卖家充值', budget: keyData.budget, used: keyData.used, remaining: 0 }));
@@ -110,10 +120,11 @@ function handleProxy(req, res) {
   let body = '';
   req.on('data', chunk => body += chunk);
   req.on('end', () => {
-    // 强制使用 V3 模型，防止客户用 V4 烧钱
+    // 强制使用客户购买的模型
+    const model = keyData.model === 'flash' ? 'deepseek-v4-flash' : 'deepseek-v4-pro';
     try {
       const parsed = JSON.parse(body);
-      parsed.model = 'deepseek-chat';  // 锁定 V3
+      parsed.model = model;
       body = JSON.stringify(parsed);
     } catch(e) {}
 
@@ -187,29 +198,49 @@ function handleAdminAPI(req, res, url) {
     req.on('data', c => body += c);
     req.on('end', () => {
       try {
-        const { name, budget, realKey } = JSON.parse(body);
-        if (!name || !budget || budget < 1000) {
+        const { name, duration, model, realKey } = JSON.parse(body);
+        if (!name || !duration || !realKey) {
           res.writeHead(400);
-          res.end(JSON.stringify({ error: 'name 必填，budget 最少 1000' }));
+          res.end(JSON.stringify({ error: 'name、duration、realKey 必填' }));
           return;
         }
+        // duration: day/week/month, model: flash/pro
+        const now = new Date();
+        let expiresAt;
+        let budget;
+        const DURATION = { day: 1, week: 7, month: 30 };
+        const BUDGET = { day: 5000000, week: 20000000, month: 50000000 };
+        if (!DURATION[duration]) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'duration 必须为 day/week/month' }));
+          return;
+        }
+        now.setDate(now.getDate() + DURATION[duration]);
+        expiresAt = now.toISOString();
+        budget = BUDGET[duration];
+
         const keys = loadKeys();
         const kid = 'sk-' + crypto.randomBytes(24).toString('hex');
+        const label = { day: '日卡', week: '周卡', month: '月卡' };
+        const modelLabel = model === 'flash' ? 'Flash' : 'Pro';
         keys[kid] = {
-          name,
-          budget: parseInt(budget),
+          name: name || (label[duration] + '-' + modelLabel),
+          budget,
           used: 0,
           realKey: realKey || '',
           active: true,
-          createdAt: new Date().toISOString().split('T')[0]
+          model: model || 'pro',
+          duration,
+          createdAt: new Date().toISOString().split('T')[0],
+          expiresAt: expiresAt.split('T')[0] + ' ' + expiresAt.split('T')[1].substring(0, 8)
         };
         saveKeys(keys);
-        log(`创建 Key: ${name} (${budget} tokens)`);
+        log(`创建 ${label[duration]}(${modelLabel}): ${keys[kid].name} (${budget} tokens, 到期: ${keys[kid].expiresAt})`);
         res.writeHead(201);
-        res.end(JSON.stringify({ success: true, key: kid, name, budget }));
+        res.end(JSON.stringify({ success: true, key: kid, name: keys[kid].name, budget, expiresAt: keys[kid].expiresAt }));
       } catch(e) {
         res.writeHead(400);
-        res.end(JSON.stringify({ error: '请求格式错误' }));
+        res.end(JSON.stringify({ error: '请求格式错误: ' + e.message }));
       }
     });
     return;
@@ -254,14 +285,17 @@ function handleAdminAPI(req, res, url) {
   if (pathname === '/admin/api/stats' && method === 'GET') {
     const keys = loadKeys();
     const list = Object.values(keys);
+    const now = new Date().toISOString();
+    const keyArr = Object.entries(keys).map(([id, data]) => ({ id, ...data }));
     res.writeHead(200);
     res.end(JSON.stringify({
       totalKeys: list.length,
       activeKeys: list.filter(k => k.active).length,
+      expiredKeys: list.filter(k => k.expiresAt && now > k.expiresAt).length,
       totalBudget: list.reduce((s, k) => s + k.budget, 0),
       totalUsed: list.reduce((s, k) => s + k.used, 0),
       totalRemaining: list.reduce((s, k) => s + k.budget - k.used, 0),
-      revenue: list.length * 9.9
+      keys: keyArr
     }));
     return;
   }
@@ -329,7 +363,7 @@ th{font-weight:600;color:#6b7280;font-size:11px;text-transform:uppercase}
 .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600}
 .badge-active{background:#d1fae5;color:#065f46}
 .badge-inactive{background:#fee2e2;color:#991b1b}
-.badge-empty{background:#fef3c7;color:#92400e}
+.badge-empty{background:#fef3c7;color:#92400e}.badge-expired{background:#fee2e2;color:#991b1b}
 .key-text{font-family:monospace;font-size:10px;background:#f3f4f6;padding:3px 6px;border-radius:4px;word-break:break-all;cursor:pointer}
 .progress-bar{width:100%;height:5px;background:#e5e7eb;border-radius:3px;overflow:hidden;margin-top:4px}
 .progress-fill{height:100%;background:#7c3aed;border-radius:3px;transition:width .3s}
@@ -358,17 +392,19 @@ th{font-weight:600;color:#6b7280;font-size:11px;text-transform:uppercase}
 <div class="card">
 <h2>➕ 创建客户 Key</h2>
 <div class="form-row">
-<div class="form-group"><label>客户名称</label><input type="text" id="newName" placeholder="例：张三-100万token"></div>
-<div class="form-group"><label>Token 额度</label><input type="number" id="newBudget" value="1000000"></div>
-<div class="form-group"><label>你的 DeepSeek Key</label><input type="text" id="newRealKey" placeholder="必填"></div>
-<button class="btn btn-primary" onclick="createKey()">创建</button>
+<div class="form-group"><label>模型</label><select id="newModel" style="width:100%;padding:8px 10px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:13px"><option value="flash">V4 Flash</option><option value="pro">V4 Pro</option></select></div>
+<div class="form-group"><label>套餐</label><select id="newDuration" style="width:100%;padding:8px 10px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:13px" onchange="updatePrice()"><option value="day">日卡 ¥2.88/¥4.88</option><option value="week">周卡 ¥16.88/¥24.88</option><option value="month">月卡 ¥44.88/¥68.88</option></select></div>
+<div class="form-group"><label>客户备注</label><input type="text" id="newName" placeholder="例：闲鱼-张三"></div>
+<div class="form-group"><label>DeepSeek Key</label><input type="text" id="newRealKey" placeholder="你的真实Key"></div>
+<button class="btn btn-primary" onclick="createKey()">创建 & 复制</button>
 </div>
+<div id="priceHint" style="font-size:12px;color:#7c3aed;margin-top:6px;font-weight:600"></div>
 </div>
 
 <div class="card">
 <h2>📋 客户 Key 列表</h2>
 <div id="loading">加载中...</div>
-<table id="keyTable" style="display:none"><thead><tr><th>客户</th><th>Key</th><th>额度</th><th>已用</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody id="tbody"></tbody></table>
+<table id="keyTable" style="display:none"><thead><tr><th>客户</th><th>Key</th><th>模型</th><th>额度/已用</th><th>到期</th><th>状态</th><th>操作</th></tr></thead><tbody id="tbody"></tbody></table>
 <div class="empty-state" id="emptyState" style="display:none">还没有 Key，👆 创建一个</div>
 </div>
 
@@ -393,14 +429,17 @@ async function login(){
   if(r.error){toast('❌ '+r.error);return}
   document.getElementById('loginBox').style.display='none';
   document.getElementById('mainPanel').style.display='block';
+  updatePrice();
   loadAll();
 }
 async function loadAll(){await Promise.all([loadStats(),loadKeys()])}
 async function loadStats(){
   const r=await api('GET','/admin/api/stats');
   if(r.error)return;
+  const PRICE={day:{flash:2.88,pro:4.88},week:{flash:16.88,pro:24.88},month:{flash:44.88,pro:68.88}};
+  let rev=0;(r.keys||[]).forEach(k=>{if(PRICE[k.duration]&&PRICE[k.duration][k.model])rev+=PRICE[k.duration][k.model]});
   document.getElementById('statsCards').innerHTML=[
-    {l:'总 Key 数',v:r.totalKeys},{l:'活跃',v:r.activeKeys},{l:'总售出',v:(r.totalBudget/1e6).toFixed(1)+'M'},{l:'剩余',v:(r.totalRemaining/1e6).toFixed(1)+'M'},{l:'预计收入',v:'¥'+(r.revenue||0).toFixed(0)}
+    {l:'总 Key 数',v:r.totalKeys},{l:'活跃',v:r.activeKeys},{l:'已过期',v:(r.expiredKeys||0)},{l:'总售出',v:(r.totalBudget/1e6).toFixed(1)+'M'},{l:'收入 ¥',v:rev.toFixed(0)}
   ].map(s=>'<div class="stat"><div class="value">'+s.v+'</div><div class="label">'+s.l+'</div></div>').join('');
 }
 async function loadKeys(){
@@ -412,27 +451,34 @@ async function loadKeys(){
   if(!r.keys||r.keys.length===0){document.getElementById('emptyState').style.display='block';return}
   document.getElementById('keyTable').style.display='table';
   const fmt=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(0)+'K':String(n);
+  const now=new Date().toISOString();
   document.getElementById('tbody').innerHTML=r.keys.map(k=>{
     const pct=k.budget>0?(k.used/k.budget*100):0;
     const cls=pct>90?'high':'';
-    const sc=!k.active?'badge-inactive':(k.used>=k.budget?'badge-empty':'badge-active');
-    const st=!k.active?'已停用':(k.used>=k.budget?'已用完':'使用中');
-    return'<tr><td><b>'+k.name+'</b></td><td><span class="key-text" onclick="navigator.clipboard.writeText(\\''+k.id+'\\');toast(\\'已复制\\')" title="点击复制">'+k.id.substring(0,18)+'...</span></td><td>'+fmt(k.budget)+'</td><td>'+fmt(k.used)+' <small>('+pct.toFixed(0)+'%)</small><div class="progress-bar"><div class="progress-fill '+cls+'" style="width:'+pct+'%"></div></div></td><td><span class="badge '+sc+'">'+st+'</span></td><td>'+k.createdAt+'</td><td><button class="btn-sm" onclick="toggleKey(\\''+k.id+'\\')">'+(k.active?'停用':'启用')+'</button> <button class="btn-danger" onclick="deleteKey(\\''+k.id+'\\')">删除</button></td></tr>';
+    const expired=k.expiresAt&&now>k.expiresAt;
+    const sc=!k.active?'badge-inactive':(expired?'badge-empty':(k.used>=k.budget?'badge-empty':'badge-active'));
+    const st=!k.active?'已停用':(expired?'已过期':(k.used>=k.budget?'已用完':'使用中'));
+    const modelL=k.model==='flash'?'⚡Flash':'💎Pro';
+    const expT=k.expiresAt?k.expiresAt.substring(0,16):'-';
+    return'<tr><td><b>'+k.name+'</b></td><td><span class="key-text" onclick="navigator.clipboard.writeText(\\''+k.id+'\\');toast(\\'已复制\\')" title="点击复制">'+k.id.substring(0,18)+'...</span></td><td>'+modelL+'</td><td>'+fmt(k.used)+' / '+fmt(k.budget)+'<div class="progress-bar"><div class="progress-fill '+cls+'" style="width:'+pct+'%"></div></div></td><td>'+expT+'</td><td><span class="badge '+sc+'">'+st+'</span></td><td><button class="btn-sm" onclick="toggleKey(\\''+k.id+'\\')">'+(k.active?'停用':'启用')+'</button> <button class="btn-danger" onclick="deleteKey(\\''+k.id+'\\')">删除</button></td></tr>';
   }).join('');
 }
+function updatePrice(){
+  const m=document.getElementById('newModel').value;
+  const d=document.getElementById('newDuration').value;
+  const p={day:{flash:'¥2.88',pro:'¥4.88'},week:{flash:'¥16.88',pro:'¥24.88'},month:{flash:'¥44.88',pro:'¥68.88'}};
+  document.getElementById('priceHint').textContent='售价: '+p[d][m]+' | 成本: ~¥0.2/百万token';
+}
 async function createKey(){
-  const name=document.getElementById('newName').value.trim();
-  const budget=parseInt(document.getElementById('newBudget').value);
+  const name=document.getElementById('newName').value.trim()||'';
+  const duration=document.getElementById('newDuration').value;
+  const model=document.getElementById('newModel').value;
   const realKey=document.getElementById('newRealKey').value.trim();
-  if(!name){toast('填客户名称');return}
-  if(!budget||budget<1000){toast('额度最少1000');return}
   if(!realKey){toast('填你的DeepSeek Key');return}
-  const r=await api('POST','/admin/api/keys',{name,budget,realKey});
+  const r=await api('POST','/admin/api/keys',{name,duration,model,realKey});
   if(r.error){toast('❌ '+r.error);return}
   await navigator.clipboard.writeText(r.key);
-  toast('✅ 已创建并复制 Key！');
-  document.getElementById('newName').value='';
-  document.getElementById('newBudget').value='1000000';
+  toast('✅ 已创建并复制 Key！到期: '+r.expiresAt);
   loadAll();
 }
 async function deleteKey(id){if(!confirm('确定删除？'))return;await api('DELETE','/admin/api/keys/'+id);toast('已删除');loadAll()}
